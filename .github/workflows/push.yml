@@ -1,3 +1,5 @@
+name: Checkout repository
+  uses: actions/checkout@v4
 name: x-push
 on:
   schedule:
