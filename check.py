@@ -137,8 +137,16 @@ def normalize(raw):
 # ---------------------------------------------------------------- 抓取
 
 SYNDICATION_SOURCES = (
-    "https://syndication.twitter.com/srv/timeline-profile/screen-name/{name}",
-    "https://cdn.syndication.twimg.com/timeline/profile?screen_name={name}&dnt=false",
+    ("syndication", "https://syndication.twitter.com/srv/timeline-profile/screen-name/{name}"),
+    ("cdn", "https://cdn.syndication.twimg.com/timeline/profile?screen_name={name}&dnt=false"),
+)
+
+# 直连被限流时，借这些公共转发服务的出口 IP 再试
+PROXIES = (
+    ("直连", "{url}"),
+    ("allorigins", "https://api.allorigins.win/raw?url={quoted}"),
+    ("codetabs", "https://api.codetabs.com/v1/proxy?quest={quoted}"),
+    ("corsproxy", "https://corsproxy.io/?{quoted}"),
 )
 
 
@@ -161,25 +169,22 @@ def parse_payload(text):
 
 
 def fetch_syndication():
-    """两个端点轮着试，遇到 429 退避重试。"""
+    """端点 × 转发服务逐个试，谁先通用谁。"""
     problems = []
-    for template in SYNDICATION_SOURCES:
-        url = template.format(name=urllib.parse.quote(SCREEN_NAME))
-        for attempt in range(3):
+    for source_name, template in SYNDICATION_SOURCES:
+        raw = template.format(name=urllib.parse.quote(SCREEN_NAME))
+        quoted = urllib.parse.quote(raw, safe="")
+        for proxy_name, proxy in PROXIES:
+            url = proxy.format(url=raw, quoted=quoted)
             try:
-                return parse_payload(
-                    http_get(url, headers={"Accept-Language": "en-US,en;q=0.9"})
-                )
-            except urllib.error.HTTPError as exc:
-                problems.append("{} -> HTTP {}".format(url, exc.code))
-                if exc.code in (429, 502, 503):
-                    time.sleep(4 * (attempt + 1))
-                    continue
-                break
+                body = http_get(url, headers={"Accept-Language": "en-US,en;q=0.9"})
+                tweets = parse_payload(body)
+                log("抓取成功：{} / {}".format(source_name, proxy_name))
+                return tweets
             except Exception as exc:  # noqa: BLE001
-                problems.append("{} -> {}".format(url, exc))
-                break
-    raise RuntimeError("抓取失败：" + " | ".join(problems))
+                problems.append("{} / {}: {}".format(source_name, proxy_name, exc))
+                time.sleep(1.5)
+    raise RuntimeError("全部来源失败：\n  " + "\n  ".join(problems))
 
 
 def fetch_rss():
