@@ -36,6 +36,10 @@ NAPCAT_URL = (os.environ.get("NAPCAT_URL") or "").strip().rstrip("/")
 NAPCAT_TOKEN = (os.environ.get("NAPCAT_TOKEN") or "").strip()
 QQ_ID = (os.environ.get("QQ_ID") or "").strip()
 
+# X 小号 cookie（cookie 通道用，可选）
+X_AUTH_TOKEN = (os.environ.get("X_AUTH_TOKEN") or "").strip()
+X_CT0 = (os.environ.get("X_CT0") or "").strip()
+
 STATE_PATH = Path("state.json")
 ARCHIVE_PATH = Path("archive.md")
 
@@ -187,6 +191,46 @@ def fetch_syndication():
     raise RuntimeError("全部来源失败：\n  " + "\n  ".join(problems))
 
 
+def fetch_twscrape():
+    """用 X 小号 cookie 走 GraphQL。配额按账号算，不吃 GitHub IP 的连坐。"""
+    import asyncio
+
+    from twscrape import API, gather  # 延迟导入：没装也不影响别的通道
+
+    cookies = "auth_token={}; ct0={}".format(X_AUTH_TOKEN, X_CT0)
+
+    async def run():
+        api = API("/tmp/twscrape.db")
+        await api.pool.add_account_cookies("main", cookies)
+        user = await api.user_by_login(SCREEN_NAME)
+        if user is None:
+            raise RuntimeError("查不到账号 @" + SCREEN_NAME)
+        tweets = await gather(api.user_tweets(user.id, limit=20))
+        result = []
+        for tw in tweets:
+            images = []
+            for item in getattr(tw, "media", None) or []:
+                url = getattr(item, "url", None) or getattr(item, "thumbnailUrl", None)
+                if url and "pbs.twimg.com" in url:
+                    images.append(url.split("?")[0])
+            result.append(
+                {
+                    "id": str(tw.id),
+                    "text": getattr(tw, "rawContent", "") or "",
+                    "created": str(getattr(tw, "date", "")),
+                    "images": images[:4],
+                    "url": "https://x.com/{}/status/{}".format(SCREEN_NAME, tw.id),
+                }
+            )
+        return result
+
+    tweets = asyncio.run(run())
+    if not tweets:
+        raise RuntimeError("twscrape 没有返回任何推文")
+    log("抓取成功：twscrape（cookie 通道），共 {} 条".format(len(tweets)))
+    return tweets
+
+
 def fetch_rss():
     root = ET.fromstring(http_get(RSS_URL))
     tweets = []
@@ -328,7 +372,17 @@ def main():
 
     tweets = None
     try:
-        tweets = fetch_rss() if RSS_URL else fetch_syndication()
+        if RSS_URL:
+            tweets = fetch_rss()
+        elif X_AUTH_TOKEN and X_CT0:
+            try:
+                tweets = fetch_twscrape()
+            except Exception as exc:  # noqa: BLE001
+                log("cookie 通道失败:", exc)
+                log("退回 syndication 再试一次")
+                tweets = fetch_syndication()
+        else:
+            tweets = fetch_syndication()
     except Exception as exc:  # noqa: BLE001
         log("抓取失败:", exc)
         if "429" in str(exc) or "HTTP Error" in str(exc) or "timed out" in str(exc):
