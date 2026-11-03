@@ -140,6 +140,50 @@ def normalize(raw):
 
 # ---------------------------------------------------------------- 抓取
 
+FX_API = "https://api.fxtwitter.com/2/profile/{name}/statuses?count={count}"
+FX_UA = "x-push-bot/1.0 (+https://github.com)"
+
+
+def fetch_fxtwitter(count=20):
+    """FxTwitter 公共 v2 接口：零账号、零 cookie，出口 IP 是 FxTwitter 的。"""
+    url = FX_API.format(name=urllib.parse.quote(SCREEN_NAME), count=count)
+    body = http_get(url, headers={"User-Agent": FX_UA, "Accept": "application/json"})
+    data = json.loads(body)
+    if data.get("code") != 200:
+        raise RuntimeError(
+            "FxTwitter code={} {}".format(data.get("code"), data.get("message"))
+        )
+
+    tweets = []
+    for item in data.get("results") or []:
+        if item.get("type") != "status":
+            continue
+        tid = str(item.get("id", ""))
+        if not tid.isdigit():
+            continue
+        author = (item.get("author") or {}).get("screen_name", "")
+        media = item.get("media") or {}
+        images = [m.get("url", "").split("?")[0] for m in (media.get("photos") or [])]
+        tweets.append(
+            {
+                "id": tid,
+                "text": (item.get("text") or "").strip(),
+                "created": item.get("created_at") or "",
+                "images": [u for u in images if u][:4],
+                "url": item.get("url") or "https://x.com/{}/status/{}".format(SCREEN_NAME, tid),
+                "author": author,
+            }
+        )
+
+    # 只要本人的推文，过滤掉它转发的别人的帖子
+    own = [t for t in tweets if t["author"].lower() == SCREEN_NAME.lower()]
+    tweets = own or tweets
+    if not tweets:
+        raise RuntimeError("FxTwitter 没有返回任何推文")
+    log("抓取成功：fxtwitter，共 {} 条".format(len(tweets)))
+    return tweets
+
+
 SYNDICATION_SOURCES = (
     ("syndication", "https://syndication.twitter.com/srv/timeline-profile/screen-name/{name}"),
     ("cdn", "https://cdn.syndication.twimg.com/timeline/profile?screen_name={name}&dnt=false"),
@@ -200,7 +244,7 @@ def fetch_twscrape():
     cookies = "auth_token={}; ct0={}".format(X_AUTH_TOKEN, X_CT0)
 
     async def run():
-        api = API("/tmp/twscrape.db")
+        api = API("/tmp/twscrape.db", raise_when_no_account=True, wait_timeout=5)
         await api.pool.add_account_cookies("main", cookies)
         user = await api.user_by_login(SCREEN_NAME)
         if user is None:
@@ -277,7 +321,7 @@ def push_bark(tweet):
     title = "@{} 新推文".format(SCREEN_NAME)
     params = {"url": tweet["url"], "group": "X", "isArchive": "1"}
     if tweet["images"]:
-        params["image"] = tweet["images"][0] + "?name=small"
+        params["image"] = tweet["images"][0].split("?")[0] + "?name=small"
     url = "{}/{}/{}/{}?{}".format(
         BARK_SERVER,
         BARK_KEY,
@@ -317,7 +361,9 @@ def push_napcat(tweet):
         }
     ]
     for image in tweet["images"][:4]:
-        message.append({"type": "image", "data": {"file": image + "?name=large"}})
+        message.append(
+            {"type": "image", "data": {"file": image.split("?")[0] + "?name=large"}}
+        )
     headers = {"Authorization": "Bearer " + NAPCAT_TOKEN} if NAPCAT_TOKEN else {}
     try:
         log("NapCat ->", http_post_json(
@@ -374,15 +420,19 @@ def main():
     try:
         if RSS_URL:
             tweets = fetch_rss()
-        elif X_AUTH_TOKEN and X_CT0:
-            try:
-                tweets = fetch_twscrape()
-            except Exception as exc:  # noqa: BLE001
-                log("cookie 通道失败:", exc)
-                log("退回 syndication 再试一次")
-                tweets = fetch_syndication()
         else:
-            tweets = fetch_syndication()
+            try:
+                tweets = fetch_fxtwitter()
+            except Exception as exc:  # noqa: BLE001
+                log("FxTwitter 失败:", exc)
+                if X_AUTH_TOKEN and X_CT0:
+                    try:
+                        tweets = fetch_twscrape()
+                    except Exception as inner:  # noqa: BLE001
+                        log("cookie 通道也失败:", inner)
+                        tweets = fetch_syndication()
+                else:
+                    tweets = fetch_syndication()
     except Exception as exc:  # noqa: BLE001
         log("抓取失败:", exc)
         if "429" in str(exc) or "HTTP Error" in str(exc) or "timed out" in str(exc):
